@@ -1,0 +1,32 @@
+# IDE / 构建产物
+__pycache__/
+*.py[cod]
+*$py.class
+dist/
+build/
+*.egg-info/
+
+# IDA 数据库与中间文件
+*.i64
+*.id0
+*.id1
+*.id2
+*.idb
+*.nam
+*.til
+*.dmp
+
+# 运行/测试产物
+*.log
+tests/out/
+*.bak
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 本地环境
+.tmp/
+*.local
