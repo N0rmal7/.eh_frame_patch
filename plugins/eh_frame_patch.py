@@ -62,6 +62,15 @@ from ehp import (  # noqa: E402
 )
 from ehp.plan import Check, SegPerm, Segment  # noqa: E402
 
+# Qt is imported once, at module level: the editor's helper methods
+# (_refresh, _queue_refresh) run from Qt slots and must not depend on a local
+# import made inside __init__.  A NameError there escapes the slot and IDA
+# appears to hang, which is exactly the bug this fixes.
+try:
+    from PyQt5 import QtCore, QtGui, QtWidgets  # noqa: E402
+except Exception:  # pragma: no cover - IDA always ships PyQt5
+    QtCore = QtGui = QtWidgets = None
+
 ACTION_PATCH = "eh_frame_patch:patch"
 ACTION_EXPORT = "eh_frame_patch:export"
 ACTION_INFO = "eh_frame_patch:info"
@@ -491,7 +500,6 @@ class PatchForm:
     """Qt editor: explicit inputs, visible preview, no native Form layout tricks."""
 
     def __init__(self, ea, budget=None, source="", return_ea=None):
-        from PyQt5 import QtCore, QtGui, QtWidgets
         self.bits = _current_bits()
         self.mem = MEM
         self._plan = None
@@ -550,25 +558,60 @@ class PatchForm:
         layout.addWidget(buttons)
         self._timer = QtCore.QTimer(self.dialog)
         self._timer.setSingleShot(True)
-        self._timer.setInterval(180)
-        self._timer.timeout.connect(self._refresh)
+        self._timer.setInterval(self.MIN_REFRESH_INTERVAL)
+        # The timer only re-runs the throttled queue (a coalesced edit that was
+        # skipped); it never drives the actual refresh directly.
+        self._timer.timeout.connect(self._queue_refresh)
         for field in (self.c_addr, self.c_budget, self.c_ret):
             field.textChanged.connect(self._queue_refresh)
         self.c_asm.textChanged.connect(self._queue_refresh)
         for box in (self.c_reanalyze, self.c_pad, self.c_cross):
             box.toggled.connect(self._queue_refresh)
+        # `_pending_since` implements a deadline: while the user keeps typing the
+        # timer keeps being restarted, so a plain single-shot timer would never
+        # `_last_refresh_ms` drives the throttle in _queue_refresh.
+        self._pending_since = None
+        self._last_refresh_ms = 0
         self._refresh()
 
+    #: minimum gap between two automatic preview refreshes (ms)
+    MIN_REFRESH_INTERVAL = 120
+
     def _queue_refresh(self, *_):
-        self.patch_button.setEnabled(False)
-        self.c_status.setText("Preview pending...")
-        self._timer.start()
+        """Refresh the preview, throttled so typing stays smooth.
+
+        Earlier versions used a debounce timer, which could leave the editor
+        showing "Preview pending..." forever when the timer was restarted on
+        every keystroke (or stopped by a concurrent refresh).  That reads as a
+        freeze, so the refresh is now synchronous and simply skipped when a
+        very recent refresh already happened.
+        """
+        try:
+            now = QtCore.QDateTime.currentMSecsSinceEpoch()
+            last = getattr(self, "_last_refresh_ms", 0)
+            if now - last < self.MIN_REFRESH_INTERVAL:
+                # too soon: coalesce, a follow-up timer picks it up
+                if not self._timer.isActive():
+                    self._timer.start(self.MIN_REFRESH_INTERVAL)
+                return
+            self._refresh()
+        except Exception:
+            traceback.print_exc()
 
     def _opt_flags(self):
         return (self.c_reanalyze.isChecked(), self.c_pad.isChecked(), self.c_cross.isChecked())
 
     def _refresh(self):
+        """Recompute the plan and repaint the preview.
+
+        Every exception is swallowed here on purpose: this runs from a Qt timer
+        slot, and an exception escaping a slot makes PyQt abort the whole
+        process (the "IDA stops responding" symptom).  A broken preview must
+        never take the editor down.
+        """
         self._timer.stop()
+        self._pending_since = None
+        self._last_refresh_ms = QtCore.QDateTime.currentMSecsSinceEpoch()
         try:
             ea = int(self.c_addr.text().strip(), 16)
             budget = int(self.c_budget.text().strip(), 10)
@@ -595,6 +638,23 @@ class PatchForm:
             self.patch_button.setEnabled(False)
             self.c_status.setText(str(exc))
             self.c_preview.setPlainText("Invalid input: %s" % exc)
+        except Exception:
+            # Anything else (Keystone quirks, IDA API failures on odd addresses,
+            # malformed text) must not escape a Qt slot.
+            self._plan = None
+            self.patch_button.setEnabled(False)
+            detail = traceback.format_exc()
+            print("eh_frame_patch: preview failed\n" + detail)
+            self.c_status.setText("preview failed - see Output window")
+            try:
+                self.c_preview.setPlainText(
+                    "Preview failed; the editor is still usable.\n\n"
+                    "Fix the assembly or the address fields. Details were "
+                    "printed to the Output window.\n\n"
+                    + detail
+                )
+            except Exception:
+                pass
         return self._plan
 
     def _accept(self):
